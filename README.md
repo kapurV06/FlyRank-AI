@@ -78,7 +78,8 @@ content-type: application/json
 
 
 
-!\[Swagger UI](swagger-screenshot.png)
+<img width="1907" height="1017" alt="helllo" src="https://github.com/user-attachments/assets/491931e0-d0e1-487a-bcf0-23e26f849816" />
+
 
 
 
