@@ -1,135 +1,136 @@
-from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
+"""
+main.py — the pipeline, one stage after another:
+fetch -> extract -> normalize -> validate -> store -> report.
 
-import db
-from auth import supabase, get_current_user
+Run:
+    python src/main.py
+"""
 
-app = FastAPI()
+import json
+import os
+import time
+from datetime import datetime, timezone
 
+from pydantic import ValidationError
 
-@app.on_event("startup")
-def on_startup():
-    # Connect using DATABASE_URL, create the table if missing,
-    # seed three example tasks only if the table is empty.
-    db.init_db()
+from fetch import fetch, check_robots
+from extract import parse_catalogue_page, parse_book_page
+from normalize import normalize
+from schema import BookRecord
 
+BASE_URL = "https://books.toscrape.com/"
+FIRST_CATALOGUE_URL = BASE_URL + "catalogue/page-1.html"
+MAX_CATALOGUE_PAGES = 3
 
-@app.get("/")
-def root():
-    return {"name": "Task API", "version": "4.0", "endpoints": ["/tasks", "/auth", "/public", "/protected"]}
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
 
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "db": "ok" if db.ping() else "down"}
-
-
-# ---------------------------------------------------------------------
-# A3 — tasks (unchanged)
-# ---------------------------------------------------------------------
-
-@app.get("/tasks")
-def get_tasks():
-    return db.get_all_tasks()
+# For Stage 5's checkpoint: add a fake URL here to prove one broken page
+# doesn't take the run down. Leave empty for a normal run.
+#   EXTRA_TEST_URLS = ["https://books.toscrape.com/catalogue/does-not-exist/index.html"]
+EXTRA_TEST_URLS = []
 
 
-@app.get("/tasks/{task_id}")
-def get_task(task_id: int):
-    task = db.get_task(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return task
+def cache_name_for(url: str) -> str:
+    """Turn a URL into a filesystem-safe cache filename."""
+    safe = url.replace("https://", "").replace("http://", "")
+    safe = safe.replace("/", "_")
+    if not safe.endswith(".html"):
+        safe += ".html"
+    return safe
 
 
-class TaskCreate(BaseModel):
-    title: str
+def discover_book_urls(stats: dict):
+    """Stage 2: walk the catalogue's own 'next' links, collect unique book URLs."""
+    book_urls = []
+    page_url = FIRST_CATALOGUE_URL
+    pages_seen = 0
+
+    while page_url and pages_seen < MAX_CATALOGUE_PAGES:
+        pages_seen += 1
+        html, _ = fetch(page_url, f"catalogue-page-{pages_seen}.html", stats)
+        if html is None:
+            break
+
+        urls, next_url = parse_catalogue_page(html, page_url)
+        book_urls.extend(urls)
+        page_url = next_url
+
+    unique_urls = list(dict.fromkeys(book_urls))  # de-dupe, keep order
+    print(f"catalogue_pages={pages_seen} discovered={len(book_urls)} unique_urls={len(unique_urls)}")
+    return unique_urls
 
 
-@app.post("/tasks", status_code=201)
-def create_task(task: TaskCreate):
-    if not task.title.strip():
-        raise HTTPException(status_code=400, detail="title is required")
-    return db.create_task(task.title)
+def extract_and_validate(book_urls, stats):
+    """Stage 3 + 4: fetch each book page, normalize it, validate it."""
+    valid_records = []
+    invalid_records = []
+
+    for url in book_urls:
+        html, _ = fetch(url, cache_name_for(url), stats)
+        if html is None:
+            continue  # already logged in stats["failed_pages"] by fetch()
+
+        raw = parse_book_page(html, product_url=url, source_page=FIRST_CATALOGUE_URL)
+        normalized = normalize(raw)
+
+        try:
+            record = BookRecord(**normalized)
+            valid_records.append(json.loads(record.model_dump_json()))
+        except ValidationError as exc:
+            invalid_records.append({"record": normalized, "reason": str(exc)})
+
+    return valid_records, invalid_records
 
 
-class TaskUpdate(BaseModel):
-    title: str
-    done: bool
+def dedupe_by_product_url(records):
+    """Canonical URL is identity — the same book counted twice counts once."""
+    seen = {}
+    for record in records:
+        seen[record["product_url"]] = record
+    return list(seen.values())
 
 
-@app.put("/tasks/{task_id}")
-def update_task(task_id: int, update: TaskUpdate):
-    if not update.title.strip():
-        raise HTTPException(status_code=400, detail="title is required")
-    task = db.update_task(task_id, update.title, update.done)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return task
+def write_json(path, data):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
-@app.delete("/tasks/{task_id}", status_code=204)
-def delete_task(task_id: int):
-    deleted = db.delete_task(task_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return
-
-
-# ---------------------------------------------------------------------
-# A4 — auth (new)
-# ---------------------------------------------------------------------
-
-class AuthCredentials(BaseModel):
-    email: str
-    password: str
-
-
-@app.post("/auth/signup", status_code=201)
-def signup(creds: AuthCredentials):
-    if not creds.email.strip() or not creds.password.strip():
-        raise HTTPException(status_code=400, detail="email and password are required")
-    try:
-        result = supabase.auth.sign_up(
-            {"email": creds.email, "password": creds.password}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"user": result.user}
-
-
-@app.post("/auth/login")
-def login(creds: AuthCredentials):
-    if not creds.email.strip() or not creds.password.strip():
-        raise HTTPException(status_code=400, detail="email and password are required")
-    try:
-        result = supabase.auth.sign_in_with_password(
-            {"email": creds.email, "password": creds.password}
-        )
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid login credentials")
-    return {
-        "access_token": result.session.access_token,
-        "refresh_token": result.session.refresh_token,
+def main():
+    start = time.time()
+    stats = {
+        "pages_fetched": 0,
+        "cache_hits": 0,
+        "failed_pages": [],
     }
 
+    robots_note = check_robots(BASE_URL)
+    print(robots_note)
 
-@app.post("/auth/logout", status_code=204)
-def logout(user=Depends(get_current_user)):
-    supabase.auth.sign_out()
-    return
+    book_urls = discover_book_urls(stats)
+    book_urls.extend(EXTRA_TEST_URLS)
+
+    valid_records, invalid_records = extract_and_validate(book_urls, stats)
+    valid_records = dedupe_by_product_url(valid_records)
+
+    write_json(os.path.join(OUTPUT_DIR, "books.json"), valid_records)
+    write_json(os.path.join(OUTPUT_DIR, "errors.json"), invalid_records)
+
+    duration_seconds = round(time.time() - start, 2)
+    report = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "duration_seconds": duration_seconds,
+        "pages_fetched": stats["pages_fetched"],
+        "cache_hits": stats["cache_hits"],
+        "valid_records": len(valid_records),
+        "invalid_records": len(invalid_records),
+        "failed_pages": len(stats["failed_pages"]),
+        "failed_page_details": stats["failed_pages"],
+    }
+    write_json(os.path.join(OUTPUT_DIR, "run-report.json"), report)
+
+    print(json.dumps(report, indent=2))
 
 
-@app.get("/public/info")
-def public_info():
-    return {"message": "Welcome stranger! This info is public."}
-
-
-@app.get("/protected/profile")
-def profile(user=Depends(get_current_user)):
-    return {"id": user.id, "email": user.email, "created_at": user.created_at}
-
-
-@app.get("/protected/dashboard")
-def dashboard(user=Depends(get_current_user)):
-    # Same guard, second door — nothing new to write.
-    return {"message": f"Welcome back, {user.email}"}
+if __name__ == "__main__":
+    main()
