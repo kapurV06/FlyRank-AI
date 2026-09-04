@@ -114,6 +114,4 @@ respect a site's stated rate limits and rules.
 
 ## Known limitation
 
-*(Write one honest limitation here — e.g. selectors are tied to Books
-to Scrape's current HTML structure and would break if the site's
-markup changed.)*
+selectors are tied to Books to Scrape's current HTML structure and would break if the site's markup changed.
