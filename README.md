@@ -1,84 +1,119 @@
-## A4 — Auth with Supabase
+# The polite scraper — Books to Scrape
 
-Sign up, log in, log out, and two guarded routes — backed by Supabase Auth
-as the identity provider. This server never hashes a password or signs a
-token itself; it forwards credentials to Supabase and verifies the JWTs
-Supabase hands back.
+A small pipeline that downloads the first three catalogue pages of
+[Books to Scrape](https://books.toscrape.com), visits all 60 book pages,
+and turns the HTML into clean, schema-checked JSON. Fetch → extract →
+normalize → validate → store → report.
 
-### Setup
+## Target classification
 
-1. Create a free project at [supabase.com](https://supabase.com).
-2. **Project Settings → API** → copy the **Project URL** and the **`anon`
-   public key** (never the `service_role` key — that one bypasses security).
-3. **Authentication → Sign In / Providers → Email** → turn off **"Confirm
-   email"** so a fresh signup can log in immediately (practice project only —
-   leave it on in production).
-4. `cp .env.example .env` and fill in `SUPABASE_URL` and `SUPABASE_KEY`.
+- **Site:** [books.toscrape.com](https://books.toscrape.com) — the
+  [toscrape.com](https://toscrape.com) project explicitly describes
+  itself as a sandbox built for people to practise scraping on, with
+  no real business behind it.
+- **Scope:** the first 3 catalogue pages only (60 books total) — not
+  the whole site.
+- **Data collected:** title, price, availability, star rating, and
+  description for each book — all publicly rendered in the page HTML,
+  nothing behind a login.
+- **robots.txt result:** *(fill in after running `python src/main.py`
+  once — the run prints the robots.txt contents or "no robots file
+  found" at the top of its output)*
+- **Why this is appropriate here:** the target is a public sandbox
+  built for exactly this exercise, the data is already public in the
+  HTML the server sends, and the scraper never authenticates or
+  bypasses anything.
 
-### Run it
+**I will not reuse this code on another site without checking its
+rules and terms first.**
+
+## Setup & run
 
 ```
-docker compose up
-```
-
-or locally:
-
-```
+cd scraper
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+python src/main.py
 ```
 
-Swagger UI is at `http://localhost:8000/docs` — click **Authorize**, paste
-an access token from `/auth/login`, then **Try it out** on any protected
-route.
+Outputs land in `output/`:
+- `books.json` — up to 60 validated records
+- `errors.json` — any record that failed schema validation, with a reason
+- `run-report.json` — counts and timing for the run
 
-### Endpoints
+Run it twice — the second run reads mostly from `cache/` and still
+produces exactly 60 records in `books.json`, not 120.
 
-| Method | Path                    | Auth required | Description                    |
-|--------|-------------------------|:--:|----------------------------------------------|
-| POST   | `/auth/signup`          | no  | Create a new user account            |
-| POST   | `/auth/login`           | no  | Authenticate, returns access + refresh token |
-| POST   | `/auth/logout`          | yes | Ends the session                     |
-| GET    | `/public/info`          | no  | Open, unauthenticated data            |
-| GET    | `/protected/profile`    | yes | Returns the caller's own profile      |
-| GET    | `/protected/dashboard`  | yes | Second protected route — same guard, no new code |
+## Politeness rules
 
-### Example flow
+- **User-agent:** every request identifies itself as
+  `FlyRankInternshipA9/1.0 (+https://github.com/kapurV06/FlyRank-AI)`.
+- **Timeout:** every request gives up after 10 seconds.
+- **Delay:** at least 500ms between real (non-cached) requests.
+- **Cache:** every fetched page is saved to `cache/`; a second run
+  reads the saved copy instead of asking the site again.
+- **Status check:** only a `200` is treated as a page; `404`/`403` are
+  never retried, a `5xx` or timeout is retried once.
 
-```
-$ curl -i -X POST http://localhost:8000/auth/signup \
-  -H "Content-Type: application/json" \
-  -d '{"email":"test@example.com","password":"password123"}'
-# 201
+## Record schema
 
-$ curl -i -X POST http://localhost:8000/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email":"test@example.com","password":"password123"}'
-# 200, returns access_token
-
-$ curl -i http://localhost:8000/protected/profile \
-  -H "Authorization: Bearer <ACCESS_TOKEN>"
-# 200
-
-$ curl -i http://localhost:8000/protected/profile \
-  -H "Authorization: Bearer tampered_token"
-# 401 {"detail":"Invalid or expired token"}
+```json
+{
+  "title": "A Light in the Attic",
+  "product_url": "https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html",
+  "price_text": "£51.77",
+  "price_gbp": 51.77,
+  "availability_text": "In stock (22 available)",
+  "rating_text": "Three",
+  "description": "...",
+  "source_page": "https://books.toscrape.com/catalogue/page-1.html",
+  "fetched_at": "2026-08-06T10:00:00+00:00"
+}
 ```
 
-*(Replace with your own real output and a Swagger screenshot before
-submitting.)*
+`product_url` is each record's canonical identity — the same book
+counted twice still counts once. `description` is `null` when a book
+has none; nothing is invented.
 
-### 401 vs 403
+## Surviving a broken page
 
-`401` means "I don't know who you are" — no token, a malformed header, or
-one Supabase can't verify. `403` would mean "I know exactly who you are,
-and you still may not" — e.g. a non-admin hitting an admin-only route
-(see the stretch goal). This assignment only implements `401`; a `403`
-case is a stretch extra.
+Uncomment `EXTRA_TEST_URLS` in `src/main.py` with a made-up book URL,
+run once, and confirm: the run still finishes, `books.json` still has
+the 60 good records, and `run-report.json` shows `failed_pages: 1`.
 
-### Auth guard
+## Why no browser
 
-`auth.py` holds the Supabase client and `get_current_user`, the one
-function every protected route depends on (`user=Depends(get_current_user)`).
-Adding a new locked door means adding that one line — see
-`/protected/dashboard`, which reuses the exact same guard as `/protected/profile`.
+The data needed here (title, price, availability, rating, description)
+is already present in the HTML the server sends on first response —
+confirmed by viewing page source before writing any selector. A
+headless browser would add real cost (memory, startup time, a
+Chromium dependency) for zero benefit on a server-rendered site like
+this one.
+
+## Sample run report
+
+*(Paste one real `run-report.json` here before submitting.)*
+
+```json
+{
+  "started_at": "PASTE_HERE",
+  "duration_seconds": 0,
+  "pages_fetched": 0,
+  "cache_hits": 0,
+  "valid_records": 60,
+  "invalid_records": 0,
+  "failed_pages": 0
+}
+```
+
+## Ethics note
+
+Use an official API when one exists instead of scraping. Never bypass
+logins, paywalls, CAPTCHAs, or explicit blocks. Collect only the data
+needed for the stated purpose, identify the scraper honestly, and
+respect a site's stated rate limits and rules.
+
+## Known limitation
+
+*(Write one honest limitation here — e.g. selectors are tied to Books
+to Scrape's current HTML structure and would break if the site's
+markup changed.)*
