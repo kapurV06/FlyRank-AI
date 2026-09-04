@@ -1,46 +1,84 @@
-Task API
-A simple CRUD API for managing a to-do list, built with FastAPI. Tasks are stored in a SQLite database, so data survives server restarts.
-Why SQLite
-SQLite was chosen because it needs no separate database server — the whole database lives in a single file (`tasks.db`) that's created automatically the first time the app runs. That makes it ideal for a small project like this: zero setup, zero configuration, and the file can just sit in the project folder.
-Where the database lives
-`tasks.db` sits in the project root (same folder as `main.py`). It's created automatically on first run if it doesn't exist, and the `tasks` table is created (with 3 example tasks seeded) only if the table is empty — so restarting the server never wipes or duplicates data.
-The `.db` file itself is excluded from git via `.gitignore` since it's generated data, not source code.
-Run it
-```bash
-python -m venv venv
-venv\Scripts\activate        # Windows
-pip install fastapi uvicorn
+## A4 — Auth with Supabase
+
+Sign up, log in, log out, and two guarded routes — backed by Supabase Auth
+as the identity provider. This server never hashes a password or signs a
+token itself; it forwards credentials to Supabase and verifies the JWTs
+Supabase hands back.
+
+### Setup
+
+1. Create a free project at [supabase.com](https://supabase.com).
+2. **Project Settings → API** → copy the **Project URL** and the **`anon`
+   public key** (never the `service_role` key — that one bypasses security).
+3. **Authentication → Sign In / Providers → Email** → turn off **"Confirm
+   email"** so a fresh signup can log in immediately (practice project only —
+   leave it on in production).
+4. `cp .env.example .env` and fill in `SUPABASE_URL` and `SUPABASE_KEY`.
+
+### Run it
+
+```
+docker compose up
+```
+
+or locally:
+
+```
+pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
-Server runs at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`. `tasks.db` is created automatically on first run.
-Endpoints
-Method	Path	Description
-GET	/	API info
-GET	/health	Health check
-GET	/tasks	List all tasks
-GET	/tasks/{id}	Get a single task
-POST	/tasks	Create a new task
-PUT	/tasks/{id}	Update a task
-DELETE	/tasks/{id}	Delete a task
-Example request
-```
-$ curl -i -X POST http://localhost:8000/tasks -H "Content-Type: application/json" -d "{\"title\":\"Buy milk\"}"
 
-HTTP/1.1 201 Created
-content-type: application/json
+Swagger UI is at `http://localhost:8000/docs` — click **Authorize**, paste
+an access token from `/auth/login`, then **Try it out** on any protected
+route.
 
-{"id":4,"title":"Buy milk","done":0}
-```
-(Replace with one of your own actual curl -i outputs before submitting, if different.)
-Swagger UI
-<img width="1907" height="1017" alt="helllo" src="https://github.com/user-attachments/assets/170bd738-6473-4bb9-9bb0-4c91cb590ac6" />
-Database viewer
-Explored the database directly using DB Browser for SQLite. Example query run in the Execute SQL tab:
-```sql
-SELECT * FROM tasks WHERE done = 1;
-```
-This returned only the completed tasks — confirming the API and the underlying database stay in sync, since changes made directly in the database viewer show up immediately through `GET /tasks` with no code changes required.
-<img width="1292" height="817" alt="yeayea" src="https://github.com/user-attachments/assets/63caabfd-7986-418a-b14c-b0494974fcce" />
+### Endpoints
 
-Notes
-Tasks now persist in `tasks.db` (SQLite) instead of an in-memory list — restarting the server no longer resets the data. The database file and table are created automatically if missing, and the 3 example tasks are inserted only on first run.
+| Method | Path                    | Auth required | Description                    |
+|--------|-------------------------|:--:|----------------------------------------------|
+| POST   | `/auth/signup`          | no  | Create a new user account            |
+| POST   | `/auth/login`           | no  | Authenticate, returns access + refresh token |
+| POST   | `/auth/logout`          | yes | Ends the session                     |
+| GET    | `/public/info`          | no  | Open, unauthenticated data            |
+| GET    | `/protected/profile`    | yes | Returns the caller's own profile      |
+| GET    | `/protected/dashboard`  | yes | Second protected route — same guard, no new code |
+
+### Example flow
+
+```
+$ curl -i -X POST http://localhost:8000/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"password123"}'
+# 201
+
+$ curl -i -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"password123"}'
+# 200, returns access_token
+
+$ curl -i http://localhost:8000/protected/profile \
+  -H "Authorization: Bearer <ACCESS_TOKEN>"
+# 200
+
+$ curl -i http://localhost:8000/protected/profile \
+  -H "Authorization: Bearer tampered_token"
+# 401 {"detail":"Invalid or expired token"}
+```
+
+*(Replace with your own real output and a Swagger screenshot before
+submitting.)*
+
+### 401 vs 403
+
+`401` means "I don't know who you are" — no token, a malformed header, or
+one Supabase can't verify. `403` would mean "I know exactly who you are,
+and you still may not" — e.g. a non-admin hitting an admin-only route
+(see the stretch goal). This assignment only implements `401`; a `403`
+case is a stretch extra.
+
+### Auth guard
+
+`auth.py` holds the Supabase client and `get_current_user`, the one
+function every protected route depends on (`user=Depends(get_current_user)`).
+Adding a new locked door means adding that one line — see
+`/protected/dashboard`, which reuses the exact same guard as `/protected/profile`.
